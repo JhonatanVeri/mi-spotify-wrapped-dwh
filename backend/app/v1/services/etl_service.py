@@ -9,6 +9,7 @@ description: Orquestador del pipeline ETL (versión activa). Clase EtlService co
 
 import logging
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from sqlalchemy.orm import Session
@@ -50,7 +51,7 @@ class EtlService:
                     "format": "json",
                     "autocorrect": 1,
                 },
-                timeout=5,
+                timeout=2,
             )
             data = response.json()
             logger.info(f"[LASTFM] {artist_name} → raw: {data}")
@@ -286,11 +287,25 @@ class EtlService:
         empty_artists = db.query(DimArtists).filter(
             sa_func.coalesce(sa_func.cardinality(DimArtists.genres), 0) == 0
         ).all()
+        # Llamadas a Last.fm en paralelo (máx 10 workers) para no bloquear el ETL.
+        results: Dict[str, List[str]] = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_name = {
+                executor.submit(EtlService.fetch_lastfm_genres, a.name): a.name
+                for a in empty_artists
+            }
+            for future in as_completed(future_to_name):
+                name = future_to_name[future]
+                try:
+                    results[name] = future.result()
+                except Exception:
+                    results[name] = []
+
         updated = 0
         for artist in empty_artists:
-            genres = EtlService.fetch_lastfm_genres(artist.name)
-            # Guardar siempre: géneros reales si los hay, o [''] como sentinel
-            # para no reintentar en futuros ETLs (el endpoint ya filtra strings vacíos).
+            genres = results.get(artist.name, [])
+            # [''] como sentinel: cardinality=1 → el backfill no lo reintenta;
+            # el endpoint filtra strings vacíos.
             artist.genres = genres if genres else [""]
             flag_modified(artist, "genres")
             if genres:
