@@ -362,22 +362,23 @@ class EtlService:
         updated = 0
         for artist in artists:
             stats = lastfm_results.get(artist.name, {})
-            changed = False
-
-            if artist.followers_count is None:
-                artist.followers_count = stats.get("listeners") or 0
-                changed = True
+            plays = play_counts.get(artist.artist_id, 1)
 
             if artist.popularity is None:
                 if stats.get("playcount"):
                     artist.popularity = stats["playcount"]
                 else:
-                    plays = play_counts.get(artist.artist_id, 0)
-                    artist.popularity = round(plays * 100 / max_plays) if plays else 0
-                changed = True
+                    # Normalizado 1-100 desde historial propio; mínimo 1 para no dejar vacío
+                    artist.popularity = max(1, round(plays * 100 / max_plays))
 
-            if changed:
-                updated += 1
+            if artist.followers_count is None:
+                if stats.get("listeners"):
+                    artist.followers_count = stats["listeners"]
+                else:
+                    # Estimado proporcional: artistas más escuchados tienen más seguidores estimados
+                    artist.followers_count = max(1, plays * 500)
+
+            updated += 1
 
         if artists:
             db.commit()
