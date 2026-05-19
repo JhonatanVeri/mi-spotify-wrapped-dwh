@@ -1,7 +1,11 @@
 # Dependencias
 node_modules/
+**/node_modules/
 venv/
 .pnpm-store/
+
+# Vite cache
+.vite/
 
 # Build
 dist/
