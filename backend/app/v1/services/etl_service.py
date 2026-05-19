@@ -365,18 +365,16 @@ class EtlService:
             plays = play_counts.get(artist.artist_id, 1)
 
             if artist.popularity is None:
-                if stats.get("playcount"):
-                    artist.popularity = stats["playcount"]
-                else:
-                    # Normalizado 1-100 desde historial propio; mínimo 1 para no dejar vacío
-                    artist.popularity = max(1, round(plays * 100 / max_plays))
+                # Siempre usamos el historial propio normalizado (1-100); es más fiel
+                # a la relevancia personal que el playcount global de Last.fm.
+                artist.popularity = max(1, round(plays * 100 / max_plays))
 
             if artist.followers_count is None:
-                if stats.get("listeners"):
-                    artist.followers_count = stats["listeners"]
-                else:
-                    # Estimado proporcional: artistas más escuchados tienen más seguidores estimados
-                    artist.followers_count = max(1, plays * 500)
+                estimated = max(1, plays * 500)
+                lastfm_listeners = stats.get("listeners") or 0
+                # Last.fm puede tener datos desactualizados/bajos para artistas regionales;
+                # usamos el mayor entre su valor y nuestro estimado proporcional.
+                artist.followers_count = max(estimated, lastfm_listeners)
 
             updated += 1
 
