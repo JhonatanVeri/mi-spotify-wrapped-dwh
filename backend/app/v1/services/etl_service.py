@@ -8,6 +8,8 @@ description: Orquestador del pipeline ETL (versión activa). Clase EtlService co
 """
 
 import logging
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from sqlalchemy.orm import Session
@@ -15,12 +17,51 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.models.models import DimUsers, DimArtists, DimTracks, FactListeningHistory
 from app.v1.services.spotify_client import SpotifyClient
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
 
 class EtlService:
     """Orquestador del pipeline ETL."""
+
+    # ============ HELPERS ============
+
+    @staticmethod
+    def fetch_lastfm_genres(artist_name: str) -> List[str]:
+        """
+        Obtiene los géneros/tags de un artista desde la API de Last.fm.
+
+        Args:
+            artist_name (str): Nombre del artista a consultar.
+
+        Returns:
+            List[str]: Lista de géneros (top 5 tags), vacía si no hay API key o falla la llamada.
+        """
+        if not settings.LASTFM_API_KEY:
+            logger.warning("LASTFM_API_KEY no configurado, saltando géneros")
+            return []
+        try:
+            response = requests.get(
+                "https://ws.audioscrobbler.com/2.0/",
+                params={
+                    "method": "artist.getTopTags",
+                    "artist": artist_name,
+                    "api_key": settings.LASTFM_API_KEY,
+                    "format": "json",
+                    "autocorrect": 1,
+                },
+                timeout=2,
+            )
+            data = response.json()
+            logger.info(f"[LASTFM] {artist_name} → raw: {data}")
+            tags = data.get("toptags", {}).get("tag", [])
+            genres = [t["name"].lower() for t in tags[:5] if t.get("name")]
+            logger.info(f"[LASTFM] {artist_name} → genres: {genres}")
+            return genres
+        except Exception as e:
+            logger.warning(f"Last.fm fallo para '{artist_name}': {e}")
+            return []
 
     # ============ EXTRACT ============
 
@@ -55,6 +96,9 @@ class EtlService:
         response = SpotifyClient.get_top_artists(token, limit=50)
         artists = response.get("items", [])
         logger.info(f"Artistas extraidos: {len(artists)}")
+        if artists:
+            a = artists[0]
+            logger.info(f"[DEBUG] Primer artista crudo — name={a.get('name')} popularity={a.get('popularity')} followers={a.get('followers')} genres={a.get('genres')}")
         return artists
 
     @staticmethod
@@ -229,6 +273,48 @@ class EtlService:
         logger.info(f"Historial transformado: {len(transformed)}")
         return transformed
 
+    @staticmethod
+    def backfill_artist_genres(db: Session) -> int:
+        """
+        Enriquece con Last.fm todos los artistas del DWH que aún tienen genres vacío.
+
+        Returns:
+            int: Cantidad de artistas actualizados.
+        """
+        if not settings.LASTFM_API_KEY:
+            return 0
+        from sqlalchemy import func as sa_func
+        empty_artists = db.query(DimArtists).filter(
+            sa_func.coalesce(sa_func.cardinality(DimArtists.genres), 0) == 0
+        ).all()
+        # Llamadas a Last.fm en paralelo (máx 10 workers) para no bloquear el ETL.
+        results: Dict[str, List[str]] = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_name = {
+                executor.submit(EtlService.fetch_lastfm_genres, a.name): a.name
+                for a in empty_artists
+            }
+            for future in as_completed(future_to_name):
+                name = future_to_name[future]
+                try:
+                    results[name] = future.result()
+                except Exception:
+                    results[name] = []
+
+        updated = 0
+        for artist in empty_artists:
+            genres = results.get(artist.name, [])
+            # [''] como sentinel: cardinality=1 → el backfill no lo reintenta;
+            # el endpoint filtra strings vacíos.
+            artist.genres = genres if genres else [""]
+            flag_modified(artist, "genres")
+            if genres:
+                updated += 1
+        if empty_artists:
+            db.commit()
+        logger.info(f"[LASTFM] Backfill géneros: {updated}/{len(empty_artists)} artistas actualizados")
+        return updated
+
     # ============ LOAD ============
 
     @staticmethod
@@ -281,15 +367,30 @@ class EtlService:
         updated_count = 0
         for artist in artists_data:
             existing = db.query(DimArtists).filter_by(spotify_id=artist["spotify_id"]).first()
+            incoming_genres = artist.get("genres") or []
+            if not incoming_genres:
+                fetched = EtlService.fetch_lastfm_genres(artist["name"])
+                incoming_genres = fetched if fetched else [""]
+
             if not existing:
+                artist["genres"] = incoming_genres
                 db.add(DimArtists(**artist))
                 new_count += 1
             else:
-                # Actualizar campos que pueden cambiar
-                existing.genres = list(artist.get("genres", []))
+                existing.genres = incoming_genres if incoming_genres else (existing.genres or [""])
                 flag_modified(existing, "genres")
-                existing.popularity = artist.get("popularity", existing.popularity)
-                existing.followers_count = artist.get("followers_count", existing.followers_count)
+                if artist.get("popularity") is not None:
+                    existing.popularity = artist["popularity"]
+                if artist.get("followers_count") is not None:
+                    existing.followers_count = artist["followers_count"]
+                if existing.followers_count is None:  # ← agrega esto
+                    listeners = EtlService.fetch_lastfm_listeners(existing.name)
+                    if listeners:
+                        existing.followers_count = listeners
+                if existing.popularity is None:
+                    playcount = EtlService.fetch_lastfm_playcount(existing.name)
+                    if playcount:
+                        existing.popularity = playcount
                 if artist.get("image_url"):
                     existing.image_url = artist["image_url"]
                 updated_count += 1
@@ -332,8 +433,8 @@ class EtlService:
                 db.add(DimTracks(**track_data))
                 new_count += 1
             else:
-                # Actualizar campos que pueden estar en NULL por datos históricos
-                existing.popularity = track.get("popularity", existing.popularity)
+                if track.get("popularity") is not None:
+                    existing.popularity = track["popularity"]
                 existing.explicit = track.get("explicit") if track.get("explicit") is not None else existing.explicit
                 if track.get("album_image_url"):
                     existing.album_image_url = track["album_image_url"]
@@ -344,7 +445,19 @@ class EtlService:
                     if artist:
                         existing.artist_id = artist.artist_id
                         logger.info(f"Reparado artist_id para track {track['spotify_id']}")
-                updated_count += 1
+                if existing.popularity is None:
+                    artist_name = None
+                    if existing.artist_id:
+                        artist = db.query(DimArtists).filter_by(artist_id=existing.artist_id).first()
+                        artist_name = artist.name if artist else None
+                    if artist_name:
+                        try:
+                            playcount = EtlService.fetch_lastfm_track_playcount(existing.name, artist_name)
+                            if playcount:
+                                existing.popularity = playcount
+                        except Exception as e:
+                            logger.warning(f"Error playcount track {existing.name}: {e}")
+                    updated_count += 1
         db.commit()
         logger.info(f"Canciones cargadas: {new_count} nuevas, {updated_count} actualizadas")
         return new_count, updated_count
@@ -375,6 +488,9 @@ class EtlService:
                 spotify_id=item["spotify_track_id"]
             ).first()
 
+            if track and track.popularity is None and item.get("popularity") is not None:
+                track.popularity = item["popularity"]
+
             if not track:
                 # Canción fuera del top 50 — crearla con los datos de recently-played.
                 # Usamos savepoint (begin_nested) para que un fallo de constraint
@@ -389,10 +505,11 @@ class EtlService:
                     with db.begin_nested():
                         artist = db.query(DimArtists).filter_by(spotify_id=spotify_artist_id).first()
                         if not artist:
+                            fetched = EtlService.fetch_lastfm_genres(item.get("artist_name", ""))
                             artist = DimArtists(
                                 spotify_id=spotify_artist_id,
                                 name=item.get("artist_name", "Desconocido"),
-                                genres=[],
+                                genres=fetched if fetched else [""],
                             )
                             db.add(artist)
                             db.flush()
@@ -455,3 +572,78 @@ class EtlService:
         db.commit()
         logger.info(f"Historial cargado: {new_count} nuevos, {skipped_count} saltados")
         return new_count, skipped_count
+
+
+    @staticmethod
+    def fetch_lastfm_listeners(artist_name: str) -> Optional[int]:
+        """
+        Obtiene el número de listeners de un artista desde Last.fm.
+        """
+        if not settings.LASTFM_API_KEY:
+            return None
+        try:
+            response = requests.get(
+                "https://ws.audioscrobbler.com/2.0/",
+                params={
+                    "method": "artist.getInfo",
+                    "artist": artist_name,
+                    "api_key": settings.LASTFM_API_KEY,
+                    "format": "json",
+                    "autocorrect": 1,
+                },
+                timeout=2,
+            )
+            data = response.json()
+            listeners = data.get("artist", {}).get("stats", {}).get("listeners")
+            return int(listeners) if listeners else None
+        except Exception as e:
+            logger.warning(f"Last.fm listeners fallo para '{artist_name}': {e}")
+            return None
+        
+
+    @staticmethod
+    def fetch_lastfm_playcount(artist_name: str) -> Optional[int]:
+        if not settings.LASTFM_API_KEY:
+            return None
+        try:
+            response = requests.get(
+                "https://ws.audioscrobbler.com/2.0/",
+                params={
+                    "method": "artist.getInfo",
+                    "artist": artist_name,
+                    "api_key": settings.LASTFM_API_KEY,
+                    "format": "json",
+                    "autocorrect": 1,
+                },
+                timeout=2,
+            )
+            data = response.json()
+            playcount = data.get("artist", {}).get("stats", {}).get("playcount")
+            return int(playcount) if playcount else None
+        except Exception as e:
+            logger.warning(f"Last.fm playcount fallo para '{artist_name}': {e}")
+            return None
+        
+    @staticmethod
+    def fetch_lastfm_track_playcount(track_name: str, artist_name: str) -> Optional[int]:
+        if not settings.LASTFM_API_KEY:
+            return None
+        try:
+            response = requests.get(
+                "https://ws.audioscrobbler.com/2.0/",
+                params={
+                    "method": "track.getInfo",
+                    "track": track_name,
+                    "artist": artist_name,
+                    "api_key": settings.LASTFM_API_KEY,
+                    "format": "json",
+                    "autocorrect": 1,
+                },
+                timeout=2,
+            )
+            data = response.json()
+            playcount = data.get("track", {}).get("playcount")
+            return int(playcount) if playcount else None
+        except Exception as e:
+            logger.warning(f"Last.fm track playcount fallo para '{track_name}': {e}")
+            return None
