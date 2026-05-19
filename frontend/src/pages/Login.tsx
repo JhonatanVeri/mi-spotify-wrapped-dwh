@@ -15,16 +15,29 @@
  * y puntos flotantes decorativos. Fondo #121212, acento #1DB954.
  */
 
-import { Sparkles } from "lucide-react";
+import { useState } from "react";
+import { Sparkles, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 const BACKEND_LOGIN_URL = "http://127.0.0.1:8000/v1/auth/login";
 
 export default function Login() {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
   const handleConnect = async () => {
-    const res = await fetch(BACKEND_LOGIN_URL);
-    const data = await res.json();
-    window.location.href = data.authorization_url;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(BACKEND_LOGIN_URL);
+      if (!res.ok) throw new Error(`Backend respondió ${res.status}`);
+      const data = await res.json();
+      if (!data.authorization_url) throw new Error("No se recibió URL de Spotify");
+      window.location.href = data.authorization_url;
+    } catch (e: unknown) {
+      setLoading(false);
+      setError(e instanceof Error ? e.message : "Error al conectar con el backend");
+    }
   };
 
   return (
@@ -110,27 +123,33 @@ export default function Login() {
         {/* CTA Button */}
         <Button
           onClick={handleConnect}
+          disabled={loading}
           className="w-full h-12 text-base font-bold rounded-full gap-3 transition-all duration-200 active:scale-95"
           style={{
-            background: "linear-gradient(135deg, #1DB954, #1ed760)",
+            background: loading ? "rgba(29,185,84,0.5)" : "linear-gradient(135deg, #1DB954, #1ed760)",
             color: "#000",
             boxShadow: "0 4px 24px rgba(29,185,84,0.35)",
             fontFamily: "DM Sans, sans-serif",
           }}
           onMouseEnter={(e) => {
-            (e.currentTarget as HTMLButtonElement).style.boxShadow =
-              "0 8px 32px rgba(29,185,84,0.5)";
+            if (loading) return;
+            (e.currentTarget as HTMLButtonElement).style.boxShadow = "0 8px 32px rgba(29,185,84,0.5)";
             (e.currentTarget as HTMLButtonElement).style.transform = "translateY(-1px)";
           }}
           onMouseLeave={(e) => {
-            (e.currentTarget as HTMLButtonElement).style.boxShadow =
-              "0 4px 24px rgba(29,185,84,0.35)";
+            (e.currentTarget as HTMLButtonElement).style.boxShadow = "0 4px 24px rgba(29,185,84,0.35)";
             (e.currentTarget as HTMLButtonElement).style.transform = "translateY(0)";
           }}
         >
-          <Sparkles className="w-4 h-4" />
-          Conectar con Spotify
+          {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+          {loading ? "Conectando..." : "Conectar con Spotify"}
         </Button>
+
+        {error && (
+          <p className="text-xs mt-3 px-3 py-2 rounded-lg" style={{ color: "#ff6b6b", background: "rgba(255,107,107,0.1)", border: "1px solid rgba(255,107,107,0.2)" }}>
+            {error}
+          </p>
+        )}
 
         <p className="text-xs text-white/25 mt-6">
           Al conectar, autorizas el acceso de lectura a tu historial de Spotify.
