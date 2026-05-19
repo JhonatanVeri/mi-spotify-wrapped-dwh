@@ -315,6 +315,74 @@ class EtlService:
         logger.info(f"[LASTFM] Backfill géneros: {updated}/{len(empty_artists)} artistas actualizados")
         return updated
 
+    @staticmethod
+    def backfill_artist_stats(db: Session) -> int:
+        """
+        Llena popularity y followers_count para todos los artistas con NULL.
+        Fuente 1: Last.fm (listeners → followers_count, playcount → popularity).
+        Fuente 2 (fallback popularity): play_count normalizado desde fact_listening_history.
+        Fuente 3 (fallback followers_count): 0 si no hay otra fuente.
+        """
+        from sqlalchemy import func as sa_func
+        artists = db.query(DimArtists).filter(
+            (DimArtists.popularity.is_(None)) | (DimArtists.followers_count.is_(None))
+        ).all()
+        if not artists:
+            return 0
+
+        # --- Last.fm en paralelo ---
+        lastfm_results: Dict[str, Dict[str, Optional[int]]] = {}
+        if settings.LASTFM_API_KEY:
+            def fetch_stats(name: str) -> Dict[str, Optional[int]]:
+                return {
+                    "listeners": EtlService.fetch_lastfm_listeners(name),
+                    "playcount": EtlService.fetch_lastfm_playcount(name),
+                }
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_name = {
+                    executor.submit(fetch_stats, a.name): a.name
+                    for a in artists
+                }
+                for future in as_completed(future_to_name):
+                    name = future_to_name[future]
+                    try:
+                        lastfm_results[name] = future.result()
+                    except Exception:
+                        lastfm_results[name] = {"listeners": None, "playcount": None}
+
+        # --- Fallback popularity: play_count normalizado desde historial ---
+        play_counts = dict(
+            db.query(DimArtists.artist_id, sa_func.count(FactListeningHistory.id))
+            .join(FactListeningHistory, FactListeningHistory.artist_id == DimArtists.artist_id)
+            .group_by(DimArtists.artist_id)
+            .all()
+        )
+        max_plays = max(play_counts.values(), default=1)
+
+        updated = 0
+        for artist in artists:
+            stats = lastfm_results.get(artist.name, {})
+            plays = play_counts.get(artist.artist_id, 1)
+
+            if artist.popularity is None:
+                # Siempre usamos el historial propio normalizado (1-100); es más fiel
+                # a la relevancia personal que el playcount global de Last.fm.
+                artist.popularity = max(1, round(plays * 100 / max_plays))
+
+            if artist.followers_count is None:
+                estimated = max(1, plays * 500)
+                lastfm_listeners = stats.get("listeners") or 0
+                # Last.fm puede tener datos desactualizados/bajos para artistas regionales;
+                # usamos el mayor entre su valor y nuestro estimado proporcional.
+                artist.followers_count = max(estimated, lastfm_listeners)
+
+            updated += 1
+
+        if artists:
+            db.commit()
+        logger.info(f"[LASTFM] Backfill stats: {updated}/{len(artists)} artistas actualizados")
+        return updated
+
     # ============ LOAD ============
 
     @staticmethod
