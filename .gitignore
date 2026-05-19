@@ -47,3 +47,6 @@ temp/
 # Coverage
 coverage/
 .nyc_output/
+
+node_modules/
+.vite/
