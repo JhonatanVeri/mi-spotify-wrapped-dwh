@@ -318,52 +318,67 @@ class EtlService:
     @staticmethod
     def backfill_artist_stats(db: Session) -> int:
         """
-        Enriquece con Last.fm los artistas que tienen popularity o followers_count en NULL.
-        Usa -1 como sentinel para no reintentar artistas sin datos en Last.fm.
-
-        Returns:
-            int: Cantidad de artistas actualizados con al menos un campo.
+        Llena popularity y followers_count para todos los artistas con NULL.
+        Fuente 1: Last.fm (listeners → followers_count, playcount → popularity).
+        Fuente 2 (fallback popularity): play_count normalizado desde fact_listening_history.
+        Fuente 3 (fallback followers_count): 0 si no hay otra fuente.
         """
-        if not settings.LASTFM_API_KEY:
-            return 0
+        from sqlalchemy import func as sa_func
         artists = db.query(DimArtists).filter(
             (DimArtists.popularity.is_(None)) | (DimArtists.followers_count.is_(None))
-        ).filter(
-            DimArtists.popularity != -1
         ).all()
         if not artists:
             return 0
 
-        def fetch_stats(name: str) -> Dict[str, Optional[int]]:
-            listeners = EtlService.fetch_lastfm_listeners(name)
-            playcount = EtlService.fetch_lastfm_playcount(name)
-            return {"listeners": listeners, "playcount": playcount}
+        # --- Last.fm en paralelo ---
+        lastfm_results: Dict[str, Dict[str, Optional[int]]] = {}
+        if settings.LASTFM_API_KEY:
+            def fetch_stats(name: str) -> Dict[str, Optional[int]]:
+                return {
+                    "listeners": EtlService.fetch_lastfm_listeners(name),
+                    "playcount": EtlService.fetch_lastfm_playcount(name),
+                }
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_name = {
+                    executor.submit(fetch_stats, a.name): a.name
+                    for a in artists
+                }
+                for future in as_completed(future_to_name):
+                    name = future_to_name[future]
+                    try:
+                        lastfm_results[name] = future.result()
+                    except Exception:
+                        lastfm_results[name] = {"listeners": None, "playcount": None}
 
-        results: Dict[str, Dict[str, Optional[int]]] = {}
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_name = {
-                executor.submit(fetch_stats, a.name): a.name
-                for a in artists
-            }
-            for future in as_completed(future_to_name):
-                name = future_to_name[future]
-                try:
-                    results[name] = future.result()
-                except Exception:
-                    results[name] = {"listeners": None, "playcount": None}
+        # --- Fallback popularity: play_count normalizado desde historial ---
+        play_counts = dict(
+            db.query(DimArtists.artist_id, sa_func.count(FactListeningHistory.id))
+            .join(FactListeningHistory, FactListeningHistory.artist_id == DimArtists.artist_id)
+            .group_by(DimArtists.artist_id)
+            .all()
+        )
+        max_plays = max(play_counts.values(), default=1)
 
         updated = 0
         for artist in artists:
-            stats = results.get(artist.name, {})
+            stats = lastfm_results.get(artist.name, {})
             changed = False
+
             if artist.followers_count is None:
-                artist.followers_count = stats.get("listeners") or -1
+                artist.followers_count = stats.get("listeners") or 0
                 changed = True
+
             if artist.popularity is None:
-                artist.popularity = stats.get("playcount") or -1
+                if stats.get("playcount"):
+                    artist.popularity = stats["playcount"]
+                else:
+                    plays = play_counts.get(artist.artist_id, 0)
+                    artist.popularity = round(plays * 100 / max_plays) if plays else 0
                 changed = True
-            if changed and (stats.get("listeners") or stats.get("playcount")):
+
+            if changed:
                 updated += 1
+
         if artists:
             db.commit()
         logger.info(f"[LASTFM] Backfill stats: {updated}/{len(artists)} artistas actualizados")
